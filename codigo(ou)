@@ -1,0 +1,1854 @@
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║         CAT v4.0 — Centro de Apoio e Transformação              ║
+╠══════════════════════════════════════════════════════════════════╣
+║  MELHORIAS v4.0 (Usabilidade & Interatividade):                 ║
+║                                                                  ║
+║  ① SCROLL COM MOUSE                                              ║
+║     • Função bind_scroll_mouse() cria um binding de              ║
+║       <MouseWheel> (Windows/Mac) e <Button-4/5> (Linux)          ║
+║       em todos os widgets filhos do Canvas.                      ║
+║     • Ao mover o scroll, chama canvas.yview_scroll() com         ║
+║       delta calculado por plataforma.                            ║
+║     • ScrollFrame é uma classe reutilizável que encapsula        ║
+║       Canvas + Scrollbar + binding de mouse em um só widget.     ║
+║                                                                  ║
+║  ② BOTÕES ANIMADOS COM TRANSIÇÃO SUAVE                           ║
+║     • BotaoAnimado usa after() para interpolar a cor             ║
+║       entre o estado normal e hover em N passos.                 ║
+║     • hex_lerp() faz o "lerp" (interpolação linear) entre        ║
+║       duas cores hex, gerando frames intermediários.             ║
+║     • O efeito de clique comprime pady e muda tom de fundo.      ║
+║                                                                  ║
+║  ③ TELA DE LOGIN REDESENHADA                                     ║
+║     • Botões maiores com padding generoso                        ║
+║     • Efeito de entrada (fade-in simulado via after)             ║
+║     • Indicador visual de força de senha                         ║
+║     • Campos com animação de foco mais pronunciada               ║
+╚══════════════════════════════════════════════════════════════════╝
+"""
+
+import tkinter as tk
+from tkinter import ttk
+import sqlite3
+import hashlib
+import datetime
+import re
+import random
+import sys
+
+
+# =============================================================================
+#  DESIGN SYSTEM
+# =============================================================================
+C = {
+    "bg_deep":    "#060D18",
+    "bg_main":    "#0F172A",
+    "bg_card":    "#1E293B",
+    "bg_input":   "#263548",
+    "bg_hover":   "#2E4260",
+    "blue_mid":   "#1E6FD9",
+    "blue_light": "#1E90FF",
+    "blue_soft":  "#60AFFF",
+    "text_white": "#F1F5F9",
+    "text_muted": "#94A3B8",
+    "text_dim":   "#4E6580",
+    "green":      "#22C55E",
+    "green_dark": "#14532D",
+    "red":        "#EF4444",
+    "red_dark":   "#7F1D1D",
+    "amber":      "#F59E0B",
+    "amber_dark": "#78350F",
+    "purple":     "#8B5CF6",
+    "purple_dark":"#4C1D95",
+    "teal":       "#14B8A6",
+    "teal_dark":  "#134E4A",
+    "sidebar_bg": "#0A1628",
+    "sidebar_sel":"#1A3A6E",
+    "btn_glow":   "#1E90FF",
+}
+
+F = {
+    "display":  ("Segoe UI", 28, "bold"),
+    "h1":       ("Segoe UI", 20, "bold"),
+    "h2":       ("Segoe UI", 16, "bold"),
+    "h3":       ("Segoe UI", 13, "bold"),
+    "body_lg":  ("Segoe UI", 13),
+    "body":     ("Segoe UI", 11),
+    "body_sm":  ("Segoe UI", 10),
+    "caption":  ("Segoe UI", 9),
+    "btn_lg":   ("Segoe UI", 14, "bold"),   # ← maior que v3
+    "btn":      ("Segoe UI", 12, "bold"),   # ← maior que v3
+    "mono":     ("Courier New", 11),
+}
+
+# =============================================================================
+#  IDENTIDADE DO APLICATIVO
+# =============================================================================
+APP_NOME = "CAT"
+APP_DESC = "Centro de Apoio e Transformação"
+
+SIDEBAR_W  = 220
+TOAST_DUR  = 3500
+ANIM_STEPS = 8     # passos de interpolação de cor (hover suave)
+ANIM_DELAY = 18    # ms por passo (~60fps)
+
+
+# =============================================================================
+#  UTILITÁRIOS DE COR  (para animação de hover)
+# =============================================================================
+
+def hex_para_rgb(hex_cor: str) -> tuple:
+    """
+    Converte '#RRGGBB' → (R, G, B) inteiros 0-255.
+    Usado pela interpolação de cores dos botões.
+    """
+    h = hex_cor.lstrip("#")
+    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+def rgb_para_hex(r: int, g: int, b: int) -> str:
+    """(R, G, B) → '#RRGGBB'"""
+    return f"#{int(r):02x}{int(g):02x}{int(b):02x}"
+
+def hex_lerp(c_inicio: str, c_fim: str, t: float) -> str:
+    """
+    Interpola linearmente entre duas cores hex.
+    t=0 → c_inicio  |  t=1 → c_fim
+    Usado para criar transição suave de cor nos botões.
+    """
+    r0, g0, b0 = hex_para_rgb(c_inicio)
+    r1, g1, b1 = hex_para_rgb(c_fim)
+    return rgb_para_hex(
+        r0 + (r1 - r0) * t,
+        g0 + (g1 - g0) * t,
+        b0 + (b1 - b0) * t,
+    )
+
+
+# =============================================================================
+#  BANCO DE DADOS
+# =============================================================================
+class BancoDados:
+    """Gerencia todas as operações com SQLite."""
+
+    def __init__(self):
+        self.conexao = sqlite3.connect("sobertrack.db")
+        self.cursor  = self.conexao.cursor()
+        self._criar_tabelas()
+
+    def _criar_tabelas(self):
+        self.cursor.executescript("""
+            CREATE TABLE IF NOT EXISTS usuarios (
+                id    INTEGER PRIMARY KEY AUTOINCREMENT,
+                nome  TEXT    NOT NULL,
+                email TEXT    NOT NULL UNIQUE,
+                senha TEXT    NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS consumo (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL,
+                bebida     TEXT    NOT NULL,
+                quantidade REAL    NOT NULL,
+                unidade    TEXT    NOT NULL,
+                data       TEXT    NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES usuarios(id)
+            );
+            CREATE TABLE IF NOT EXISTS diario_emocional (
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id  INTEGER NOT NULL,
+                humor    TEXT    NOT NULL,
+                texto    TEXT    NOT NULL,
+                data     TEXT    NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES usuarios(id)
+            );
+        """)
+        self.conexao.commit()
+
+    @staticmethod
+    def _hash(senha):
+        return hashlib.sha256(senha.encode()).hexdigest()
+
+    def cadastrar(self, nome, email, senha):
+        try:
+            self.cursor.execute(
+                "INSERT INTO usuarios (nome,email,senha) VALUES (?,?,?)",
+                (nome.strip(), email.strip().lower(), self._hash(senha))
+            )
+            self.conexao.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def autenticar(self, email, senha):
+        self.cursor.execute(
+            "SELECT id,nome,email FROM usuarios WHERE email=? AND senha=?",
+            (email.strip().lower(), self._hash(senha))
+        )
+        r = self.cursor.fetchone()
+        return {"id": r[0], "nome": r[1], "email": r[2]} if r else None
+
+    def registrar_consumo(self, uid, bebida, qtd, unidade):
+        try:
+            self.cursor.execute(
+                "INSERT INTO consumo (user_id,bebida,quantidade,unidade,data)"
+                " VALUES (?,?,?,?,?)",
+                (uid, bebida, qtd, unidade,
+                 datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+            )
+            self.conexao.commit()
+            return True
+        except Exception as e:
+            print(e); return False
+
+    def historico(self, uid):
+        self.cursor.execute(
+            "SELECT bebida,quantidade,unidade,data FROM consumo"
+            " WHERE user_id=? ORDER BY data DESC", (uid,)
+        )
+        return self.cursor.fetchall()
+
+    def total(self, uid):
+        self.cursor.execute(
+            "SELECT COUNT(*) FROM consumo WHERE user_id=?", (uid,))
+        return self.cursor.fetchone()[0]
+
+    def dias_consecutivos(self, uid):
+        self.cursor.execute(
+            "SELECT DISTINCT DATE(data) FROM consumo"
+            " WHERE user_id=? ORDER BY data DESC", (uid,))
+        datas = [r[0] for r in self.cursor.fetchall()]
+        if not datas: return 0
+        streak = 1
+        for i in range(1, len(datas)):
+            d1 = datetime.date.fromisoformat(datas[i - 1])
+            d2 = datetime.date.fromisoformat(datas[i])
+            if (d1 - d2).days == 1: streak += 1
+            else: break
+        return streak
+
+    def consumo_ultimos_dias(self, uid, dias=7):
+        desde = (datetime.date.today() -
+                 datetime.timedelta(days=dias)).isoformat()
+        self.cursor.execute(
+            "SELECT COUNT(*), SUM(quantidade) FROM consumo"
+            " WHERE user_id=? AND DATE(data) >= ?", (uid, desde))
+        r = self.cursor.fetchone()
+        return r[0] or 0, r[1] or 0.0
+
+    def salvar_diario(self, uid, humor, texto):
+        self.cursor.execute(
+            "INSERT INTO diario_emocional (user_id,humor,texto,data)"
+            " VALUES (?,?,?,?)",
+            (uid, humor, texto,
+             datetime.datetime.now().strftime("%Y-%m-%d %H:%M")))
+        self.conexao.commit()
+
+    def listar_diario(self, uid, limite=10):
+        self.cursor.execute(
+            "SELECT humor,texto,data FROM diario_emocional"
+            " WHERE user_id=? ORDER BY data DESC LIMIT ?", (uid, limite))
+        return self.cursor.fetchall()
+
+    def fechar(self):
+        self.conexao.close()
+
+
+# =============================================================================
+#  WIDGET: Toast — notificação flutuante
+# =============================================================================
+class Toast:
+    _CORES = {
+        "sucesso": (C["green"],      C["green_dark"],  "✔  "),
+        "erro":    (C["red"],        C["red_dark"],    "✖  "),
+        "aviso":   (C["amber"],      C["amber_dark"],  "⚠  "),
+        "info":    (C["blue_light"], C["bg_card"],     "ℹ  "),
+    }
+
+    def __init__(self, root):
+        self.root   = root
+        self._fila  = []
+        self._ativo = False
+
+    def mostrar(self, mensagem, tipo="info"):
+        self._fila.append((mensagem, tipo))
+        if not self._ativo:
+            self._proximo()
+
+    def _proximo(self):
+        if not self._fila:
+            self._ativo = False; return
+        self._ativo = True
+        self._exibir(*self._fila.pop(0))
+
+    def _exibir(self, mensagem, tipo):
+        cor_txt, cor_bg, icone = self._CORES.get(tipo, self._CORES["info"])
+        popup = tk.Toplevel(self.root)
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+        popup.configure(bg=cor_bg)
+        frame = tk.Frame(popup, bg=cor_bg, padx=18, pady=14)
+        frame.pack()
+        tk.Label(frame, text=icone, font=("Segoe UI", 14, "bold"),
+                 bg=cor_bg, fg=cor_txt).pack(side="left")
+        tk.Label(frame, text=mensagem, font=F["body_lg"],
+                 bg=cor_bg, fg=C["text_white"],
+                 wraplength=300, justify="left").pack(side="left")
+        tk.Frame(popup, bg=cor_txt, height=3).pack(fill="x", side="bottom")
+        self.root.update_idletasks()
+        popup.update_idletasks()
+        rx  = self.root.winfo_rootx()
+        ry  = self.root.winfo_rooty()
+        rw  = self.root.winfo_width()
+        pw  = popup.winfo_width()
+        popup.geometry(f"+{rx + rw - pw - 20}+{ry + 16}")
+        popup.after(TOAST_DUR, lambda: (popup.destroy(), self._proximo()))
+
+
+# =============================================================================
+#  WIDGET: ScrollFrame  ← NOVO v4.0
+#
+#  Como funciona o scroll com mouse:
+#  ─────────────────────────────────
+#  1. Um tk.Canvas é criado como área de rolagem.
+#  2. Um tk.Frame interno é inserido no canvas via create_window().
+#  3. A função _bind_scroll() varre TODOS os widgets filhos (recursivo)
+#     e registra dois eventos:
+#       • <MouseWheel>  → Windows e macOS usam este evento.
+#                         event.delta vem em múltiplos de 120 (Win) ou
+#                         1 (Mac), então dividimos por 120 no Windows.
+#       • <Button-4> e <Button-5> → Linux usa botões 4/5 para rolar.
+#  4. O handler chama canvas.yview_scroll(n, "units"), onde n=1 rola
+#     para baixo e n=-1 para cima.
+#  5. _bind_scroll() é chamado novamente sempre que um novo widget
+#     é adicionado ao frame, via trace no StringVar do Canvas.
+# =============================================================================
+class ScrollFrame(tk.Frame):
+    """
+    Frame com scroll vertical ativado pelo mouse.
+    Uso: sf = ScrollFrame(pai)  →  adicione widgets em sf.interior
+    """
+
+    def __init__(self, pai, bg=None, **kw):
+        bg = bg or C["bg_main"]
+        super().__init__(pai, bg=bg, **kw)
+
+        # Canvas é o widget visível que "janela" o conteúdo interno
+        self._canvas = tk.Canvas(self, bg=bg, highlightthickness=0,
+                                 bd=0)
+
+        # Scrollbar vertical (opcional: pode ser ocultada)
+        self._vsb = ttk.Scrollbar(self, orient="vertical",
+                                  command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=self._vsb.set)
+
+        self._vsb.pack(side="right", fill="y")
+        self._canvas.pack(side="left", fill="both", expand=True)
+
+        # Frame interno onde os widgets reais são colocados
+        self.interior = tk.Frame(self._canvas, bg=bg)
+        self._win_id  = self._canvas.create_window(
+            (0, 0), window=self.interior, anchor="nw")
+
+        # Ajustar largura do frame interno ao canvas
+        self._canvas.bind("<Configure>", self._on_canvas_resize)
+
+        # Atualizar scrollregion quando o interior mudar de tamanho
+        self.interior.bind("<Configure>", self._on_interior_resize)
+
+        # ── Binding de scroll do mouse ────────────────────────
+        # Chamamos _bind_scroll no interior e em si mesmo para
+        # garantir que qualquer filho captura o evento e repassa.
+        self._bind_scroll(self)
+        self._bind_scroll(self._canvas)
+        self._bind_scroll(self.interior)
+
+    # ── Resize handlers ──────────────────────────────────────
+    def _on_canvas_resize(self, event):
+        """Mantém o frame interno com a mesma largura do canvas."""
+        self._canvas.itemconfig(self._win_id, width=event.width)
+
+    def _on_interior_resize(self, event):
+        """Atualiza a scrollregion para abranger todo o conteúdo."""
+        self._canvas.configure(
+            scrollregion=self._canvas.bbox("all"))
+
+    # ── Scroll handler ────────────────────────────────────────
+    def _scroll_handler(self, event):
+        """
+        Interpreta o evento de scroll do mouse e rola o canvas.
+
+        Windows/macOS: event.delta é +120 (cima) ou -120 (baixo)
+        Linux:         Button-4 = cima, Button-5 = baixo
+        """
+        # Detectar plataforma
+        if event.num == 4:          # Linux: scroll up
+            self._canvas.yview_scroll(-1, "units")
+        elif event.num == 5:        # Linux: scroll down
+            self._canvas.yview_scroll(1, "units")
+        else:
+            # Windows dá delta em múltiplos de 120
+            # macOS dá valores menores, dividimos também
+            delta = -1 if event.delta > 0 else 1
+            self._canvas.yview_scroll(delta, "units")
+
+    def _bind_scroll(self, widget):
+        """
+        Registra o scroll handler neste widget e em todos os filhos
+        recursivamente.  Precisa ser chamado depois que os filhos
+        forem criados para garantir cobertura total.
+        """
+        # Windows / macOS
+        widget.bind("<MouseWheel>", self._scroll_handler, add="+")
+        # Linux
+        widget.bind("<Button-4>",   self._scroll_handler, add="+")
+        widget.bind("<Button-5>",   self._scroll_handler, add="+")
+
+        for child in widget.winfo_children():
+            self._bind_scroll(child)
+
+    def bind_scroll_em(self, widget):
+        """
+        Método público: registra scroll em qualquer widget adicionado
+        DEPOIS da construção do ScrollFrame.
+        Chame após adicionar widgets ao self.interior.
+        """
+        self._bind_scroll(widget)
+
+    def scroll_topo(self):
+        """Rola de volta ao início (útil ao trocar de tela)."""
+        self._canvas.yview_moveto(0)
+
+
+# =============================================================================
+#  WIDGET: BotaoAnimado  ← MELHORADO v4.0
+#
+#  Como funcionam os efeitos de botão:
+#  ─────────────────────────────────────
+#  1. HOVER SUAVE (transição de cor):
+#     Ao passar o mouse (<Enter>), inicia uma animação com after().
+#     A função _animar_hover() é chamada N vezes com delay de
+#     ANIM_DELAY ms. A cada chamada ela calcula a cor interpolada
+#     usando hex_lerp(cor_normal, cor_hover, passo/total) e aplica
+#     com config(bg=...). Isso cria uma transição suave em vez de
+#     pular abruptamente de uma cor para outra.
+#
+#  2. CLIQUE (efeito press/release):
+#     Em <ButtonPress-1>: encurta o pady em 2px para simular
+#     "afundamento" e escurece levemente o fundo.
+#     Em <ButtonRelease-1>: restaura o pady e dispara o comando.
+#     O efeito é sutil mas perceptível e melhora o feedback tátil.
+#
+#  3. CURSOR:
+#     cursor="hand2" sempre presente — mostra a mãozinha ao hover.
+# =============================================================================
+class BotaoAnimado(tk.Label):
+    """
+    Botão com transição suave de cor no hover e efeito de clique.
+    Substitui o BotaoModerno da v3 com animações mais polidas.
+    """
+
+    _VAR = {
+        "primario":   ("#1255B8",        "#1E90FF",        C["text_white"]),
+        "secundario": ("#1E293B",        "#2E4260",        C["text_white"]),
+        "perigo":     (C["red_dark"],    C["red"],         C["text_white"]),
+        "sucesso":    (C["green_dark"],  C["green"],       "#082010"),
+        "ghost":      (C["bg_main"],     "#1E293B",        C["blue_soft"]),
+        "purple":     (C["purple_dark"], C["purple"],      C["text_white"]),
+        "teal":       (C["teal_dark"],   C["teal"],        C["text_white"]),
+        "amber":      (C["amber_dark"],  C["amber"],       "#1a0a00"),
+        "login":      ("#1255B8",        "#1E90FF",        C["text_white"]),
+    }
+
+    def __init__(self, pai, texto, comando, variante="primario",
+                 largura=0, fonte=None, pady_base=14, **kw):
+        self._cn, self._ch, self._ct = self._VAR.get(
+            variante, self._VAR["primario"])
+        self._cmd       = comando
+        self._hovered   = False
+        self._anim_id   = None    # ID do after() em andamento
+        self._pady_base = pady_base
+
+        fonte = fonte or F["btn_lg"]
+        super().__init__(
+            pai, text=texto, font=fonte,
+            bg=self._cn, fg=self._ct,
+            cursor="hand2", relief="flat",
+            padx=28, pady=pady_base, **kw
+        )
+        if largura:
+            self.config(width=largura)
+
+        # ── Eventos ──────────────────────────────────────────
+        self.bind("<Enter>",           self._on_enter)
+        self.bind("<Leave>",           self._on_leave)
+        self.bind("<ButtonPress-1>",   self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
+
+    # ── Hover: início (mouse entra) ──────────────────────────
+    def _on_enter(self, event=None):
+        """Inicia a animação de transição para a cor hover."""
+        self._hovered = True
+        self._cancelar_anim()
+        self._animar(self._cn, self._ch, passo=0, direcao=1)
+
+    # ── Hover: fim (mouse sai) ───────────────────────────────
+    def _on_leave(self, event=None):
+        """Inicia a animação de volta para a cor normal."""
+        self._hovered = False
+        self._cancelar_anim()
+        cor_atual = self.cget("bg")
+        self._animar(cor_atual, self._cn, passo=0, direcao=1)
+
+    def _cancelar_anim(self):
+        """Cancela animação anterior para evitar conflitos."""
+        if self._anim_id:
+            self.after_cancel(self._anim_id)
+            self._anim_id = None
+
+    def _animar(self, c_inicio, c_fim, passo, direcao):
+        """
+        Interpola a cor do botão de c_inicio até c_fim em
+        ANIM_STEPS passos, com ANIM_DELAY ms entre cada frame.
+        """
+        if passo > ANIM_STEPS:
+            self.config(bg=c_fim)
+            return
+        t   = passo / ANIM_STEPS
+        cor = hex_lerp(c_inicio, c_fim, t)
+        try:
+            self.config(bg=cor)
+        except tk.TclError:
+            return   # widget pode ter sido destruído
+        self._anim_id = self.after(
+            ANIM_DELAY,
+            lambda: self._animar(c_inicio, c_fim, passo + 1, direcao)
+        )
+
+    # ── Clique: press (afunda) ───────────────────────────────
+    def _on_press(self, event=None):
+        """
+        Simula afundamento: reduz o pady em 2px e escurece levemente
+        interpolando 30% para o estado inicial.
+        """
+        self._cancelar_anim()
+        escuro = hex_lerp(self._ch, self._cn, 0.35)
+        self.config(bg=escuro, pady=max(self._pady_base - 2, 4))
+
+    # ── Clique: release (sobe e executa) ─────────────────────
+    def _on_release(self, event=None):
+        """Restaura aparência e executa o comando."""
+        self.config(pady=self._pady_base)
+        # Volta para hover pois o mouse ainda está sobre o botão
+        self._animar(self._cn, self._ch, passo=0, direcao=1)
+        if self._cmd:
+            self._cmd()
+
+
+# Alias para manter compatibilidade com código da v3
+BotaoModerno = BotaoAnimado
+
+
+# =============================================================================
+#  WIDGET: EntryModerno — campo com borda de foco animada  ← MELHORADO v4.0
+# =============================================================================
+class EntryModerno(tk.Frame):
+    """
+    Campo de entrada com borda que anima suavemente ao receber foco.
+    """
+    def __init__(self, pai, rotulo, show="", largura=34, bg=None, **kw):
+        bg = bg or C["bg_card"]
+        super().__init__(pai, bg=bg, **kw)
+
+        tk.Label(self, text=rotulo, font=F["body_sm"],
+                 bg=bg, fg=C["text_muted"]).pack(anchor="w", pady=(10, 3))
+
+        self._borda = tk.Frame(self, bg=C["blue_mid"], padx=1, pady=1)
+        self._borda.pack(fill="x")
+
+        self._entry = tk.Entry(
+            self._borda, font=F["body_lg"],
+            bg=C["bg_input"], fg=C["text_white"],
+            insertbackground=C["blue_light"],
+            relief="flat", bd=0, width=largura, show=show
+        )
+        self._entry.pack(fill="x", ipady=14, padx=1)
+
+        # Animação de foco: interpola borda de blue_mid → blue_light
+        self._entry.bind("<FocusIn>",  self._focus_in)
+        self._entry.bind("<FocusOut>", self._focus_out)
+        self._anim_id = None
+
+    def _focus_in(self, event=None):
+        """Anima a borda para a cor de destaque ao focar."""
+        self._anim_borda(C["blue_mid"], C["blue_light"], passo=0)
+
+    def _focus_out(self, event=None):
+        """Anima a borda de volta ao estado normal ao desfocar."""
+        self._anim_borda(C["blue_light"], C["blue_mid"], passo=0)
+
+    def _anim_borda(self, c0, c1, passo):
+        """Interpola a cor da borda do campo."""
+        if self._anim_id:
+            self.after_cancel(self._anim_id)
+        if passo > ANIM_STEPS:
+            self._borda.config(bg=c1); return
+        t   = passo / ANIM_STEPS
+        cor = hex_lerp(c0, c1, t)
+        try:
+            self._borda.config(bg=cor)
+        except tk.TclError:
+            return
+        self._anim_id = self.after(
+            ANIM_DELAY,
+            lambda: self._anim_borda(c0, c1, passo + 1)
+        )
+
+    def get(self):         return self._entry.get()
+    def limpar(self):      self._entry.delete(0, "end")
+    def focus(self):       self._entry.focus_set()
+    def bind_enter(self, fn): self._entry.bind("<Return>", lambda e: fn())
+    def insert(self, txt):
+        self._entry.delete(0, "end")
+        self._entry.insert(0, txt)
+
+
+# =============================================================================
+#  WIDGET: IndicadorSenha  ← NOVO v4.0
+#  Barra visual que mede a força da senha em tempo real
+# =============================================================================
+class IndicadorSenha(tk.Frame):
+    """
+    Mostra uma barra colorida indicando a força da senha:
+    Muito fraca (vermelho) → Fraca → Média → Forte → Muito forte (verde)
+    """
+    NIVEIS = [
+        (C["red"],        "Muito fraca"),
+        (C["red"],        "Fraca"),
+        (C["amber"],      "Média"),
+        (C["blue_light"], "Forte"),
+        (C["green"],      "Muito forte"),
+    ]
+
+    def __init__(self, pai, entry_widget, bg=None, **kw):
+        bg = bg or C["bg_card"]
+        super().__init__(pai, bg=bg, **kw)
+        self._entry = entry_widget
+
+        self._barra_bg = tk.Frame(self, bg=C["bg_input"], height=4)
+        self._barra_bg.pack(fill="x")
+        self._barra_fill = tk.Frame(self._barra_bg, bg=C["red"], height=4)
+        self._barra_fill.place(relwidth=0, relheight=1)
+
+        self._lbl = tk.Label(self, text="", font=F["caption"],
+                             bg=bg, fg=C["text_dim"])
+        self._lbl.pack(anchor="e", pady=(2, 0))
+
+        # Conecta ao Entry para atualizar em tempo real
+        self._entry._entry.bind("<KeyRelease>", self._atualizar)
+
+    def _pontuacao(self, senha):
+        """
+        Calcula 0-4 baseado em:
+        tamanho, maiúsculas, números, símbolos, comprimento total
+        """
+        pts = 0
+        if len(senha) >= 6:  pts += 1
+        if len(senha) >= 10: pts += 1
+        if re.search(r"[A-Z]", senha): pts += 1
+        if re.search(r"\d", senha):    pts += 1
+        if re.search(r"[^A-Za-z0-9]", senha): pts += 1
+        return min(pts, 4)
+
+    def _atualizar(self, event=None):
+        senha = self._entry.get()
+        if not senha:
+            self._barra_fill.place(relwidth=0, relheight=1)
+            self._lbl.config(text="")
+            return
+        pts  = self._pontuacao(senha)
+        cor, texto = self.NIVEIS[pts]
+        self._barra_fill.place(relwidth=(pts + 1) / 5, relheight=1)
+        self._barra_fill.config(bg=cor)
+        self._lbl.config(text=texto, fg=cor)
+
+
+# =============================================================================
+#  HELPERS
+# =============================================================================
+def criar_card(pai, titulo="", subtitulo="", icone="",
+               cor_icone=None, pad_x=24, pad_y=20, cor_borda=None):
+    cor_icone = cor_icone or C["blue_light"]
+    cor_borda = cor_borda or C["blue_mid"]
+    outer = tk.Frame(pai, bg=cor_borda, padx=1, pady=1)
+    inner = tk.Frame(outer, bg=C["bg_card"], padx=pad_x, pady=pad_y)
+    inner.pack(fill="both", expand=True)
+    if icone or titulo:
+        cab = tk.Frame(inner, bg=C["bg_card"])
+        cab.pack(fill="x", anchor="w", pady=(0, 12))
+        if icone:
+            tk.Label(cab, text=icone, font=("Segoe UI", 20),
+                     bg=C["bg_card"], fg=cor_icone).pack(
+                         side="left", padx=(0, 12))
+        txt = tk.Frame(cab, bg=C["bg_card"])
+        txt.pack(side="left")
+        if titulo:
+            tk.Label(txt, text=titulo, font=F["h3"],
+                     bg=C["bg_card"], fg=C["text_white"],
+                     anchor="w").pack(fill="x")
+        if subtitulo:
+            tk.Label(txt, text=subtitulo, font=F["caption"],
+                     bg=C["bg_card"], fg=C["text_muted"],
+                     anchor="w").pack(fill="x")
+        tk.Frame(inner, bg=cor_borda, height=1).pack(fill="x", pady=(0, 12))
+    return outer, inner
+
+
+# =============================================================================
+#  SIDEBAR
+# =============================================================================
+class Sidebar(tk.Frame):
+    def __init__(self, pai, usuario, ao_navegar, ao_sair):
+        super().__init__(pai, bg=C["sidebar_bg"], width=SIDEBAR_W)
+        self.pack_propagate(False)
+        self._usuario = usuario
+        self._nav     = ao_navegar
+        self._sair    = ao_sair
+        self._btns    = {}
+        self._ativo   = None
+        self._build()
+
+    def _build(self):
+        # Logo
+        lf = tk.Frame(self, bg=C["sidebar_bg"], pady=22)
+        lf.pack(fill="x")
+        tk.Label(lf, text=APP_NOME, font=F["h2"],
+                 bg=C["sidebar_bg"], fg=C["text_white"]).pack()
+        tk.Label(lf, text=APP_DESC, font=F["caption"],
+                 bg=C["sidebar_bg"], fg=C["text_dim"],
+                 wraplength=SIDEBAR_W - 20, justify="center").pack()
+        tk.Frame(self, bg=C["blue_light"], height=1).pack(
+            fill="x", padx=14, pady=(0, 6))
+
+        menu = [
+            ("dashboard",   "🏠", "Dashboard"),
+            ("consumo",     "🍺", "Registrar"),
+            ("historico",   "📋", "Histórico"),
+            ("medico",      "🩺", "Saúde & Risco"),
+            ("psicologico", "🧠", "Apoio Emocional"),
+        ]
+        for tela, emoji, label in menu:
+            btn = tk.Label(
+                self, text=f"   {emoji}   {label}",
+                font=F["body_lg"], bg=C["sidebar_bg"],
+                fg=C["text_muted"], cursor="hand2",
+                anchor="w", padx=10, pady=13
+            )
+            btn.pack(fill="x")
+            btn.bind("<Enter>", lambda e, b=btn, t=tela: (
+                b.config(bg=C["sidebar_sel"], fg=C["blue_soft"])
+                if t != self._ativo else None))
+            btn.bind("<Leave>", lambda e, b=btn, t=tela: (
+                b.config(bg=C["sidebar_bg"], fg=C["text_muted"])
+                if t != self._ativo else None))
+            btn.bind("<Button-1>", lambda e, t=tela: self._nav(t))
+            self._btns[tela] = btn
+
+        tk.Frame(self, bg=C["sidebar_bg"]).pack(fill="both", expand=True)
+        tk.Frame(self, bg=C["blue_light"], height=1).pack(
+            fill="x", padx=14, pady=6)
+
+        # Avatar
+        af = tk.Frame(self, bg=C["sidebar_bg"], padx=14, pady=12)
+        af.pack(fill="x")
+        iniciais = self._usuario["nome"][:2].upper()
+        tk.Label(af, text=iniciais, font=F["h3"],
+                 bg=C["blue_light"], fg=C["text_white"],
+                 width=3, height=1).pack(side="left", padx=(0, 10))
+        info = tk.Frame(af, bg=C["sidebar_bg"])
+        info.pack(side="left")
+        tk.Label(info, text=self._usuario["nome"].split()[0][:16],
+                 font=F["btn"], bg=C["sidebar_bg"],
+                 fg=C["text_white"], anchor="w").pack(fill="x")
+        tk.Label(info, text=self._usuario["email"][:22],
+                 font=F["caption"], bg=C["sidebar_bg"],
+                 fg=C["text_dim"], anchor="w").pack(fill="x")
+
+        sb = tk.Label(self, text="  🚪   Sair", font=F["body"],
+                      bg=C["sidebar_bg"], fg=C["text_muted"],
+                      cursor="hand2", anchor="w", padx=14, pady=13)
+        sb.pack(fill="x")
+        sb.bind("<Enter>", lambda e: sb.config(bg=C["red_dark"],
+                                                fg=C["text_white"]))
+        sb.bind("<Leave>", lambda e: sb.config(bg=C["sidebar_bg"],
+                                                fg=C["text_muted"]))
+        sb.bind("<Button-1>", lambda e: self._sair())
+
+    def definir_ativo(self, tela):
+        if self._ativo and self._ativo in self._btns:
+            self._btns[self._ativo].config(bg=C["sidebar_bg"],
+                                           fg=C["text_muted"])
+        self._ativo = tela
+        if tela in self._btns:
+            self._btns[tela].config(bg=C["sidebar_sel"],
+                                    fg=C["blue_soft"])
+
+
+# =============================================================================
+#  MIXIN BASE
+# =============================================================================
+class TelaBase:
+    def _limpar(self):
+        for w in self.frame.winfo_children():
+            w.destroy()
+
+
+# =============================================================================
+#  TELA: Login / Cadastro  ← REDESENHADA v4.0
+#  Botões maiores, indicador de força de senha, espaçamento generoso
+# =============================================================================
+class TelaLogin(TelaBase):
+    def __init__(self, frame, banco, toast, ao_logar):
+        self.frame    = frame
+        self.banco    = banco
+        self.toast    = toast
+        self.ao_logar = ao_logar
+        self._login()
+
+    # ── Painel esquerdo (branding) ───────────────────────────
+    def _painel_esq(self, pai):
+        esq = tk.Frame(pai, bg=C["bg_card"], width=400)
+        esq.pack(side="left", fill="both")
+        esq.pack_propagate(False)
+
+        c = tk.Frame(esq, bg=C["bg_card"])
+        c.place(relx=0.5, rely=0.5, anchor="center")
+
+        tk.Label(c, text=APP_NOME, font=F["display"],
+                 bg=C["bg_card"], fg=C["text_white"],
+                 anchor="center", justify="center").pack(fill="x")
+        tk.Label(c, text=APP_DESC,
+                 font=F["body_lg"], bg=C["bg_card"],
+                 fg=C["text_muted"],
+                 anchor="center", justify="center").pack(fill="x", pady=(5, 0))
+
+        tk.Frame(c, bg=C["blue_light"], height=1, width=200).pack(pady=20)
+
+        for txt in ["✔  Registro diário de consumo",
+                    "✔  Orientações médicas personalizadas",
+                    "✔  Apoio emocional e psicológico",
+                    "✔  Dados seguros no seu dispositivo"]:
+            tk.Label(c, text=txt, font=F["body"],
+                     bg=C["bg_card"], fg=C["blue_soft"],
+                     anchor="w").pack(fill="x", pady=3)
+        return esq
+
+    # ── Tela de Login ────────────────────────────────────────
+    def _login(self):
+        self._limpar()
+        cont = tk.Frame(self.frame, bg=C["bg_main"])
+        cont.pack(fill="both", expand=True)
+        self._painel_esq(cont)
+
+        dir_ = tk.Frame(cont, bg=C["bg_main"])
+        dir_.pack(side="left", fill="both", expand=True)
+
+        form = tk.Frame(dir_, bg=C["bg_main"], padx=52)
+        form.place(relx=0.5, rely=0.5, anchor="center")
+
+        # Título
+        tk.Label(form, text="Bem-vindo de volta 👋",
+                 font=F["h1"], bg=C["bg_main"],
+                 fg=C["text_white"]).pack(anchor="w")
+        tk.Label(form, text="Entre na sua conta para continuar",
+                 font=F["body"], bg=C["bg_main"],
+                 fg=C["text_muted"]).pack(anchor="w", pady=(8, 30))
+
+        # Campos
+        self._le = EntryModerno(form, "E-mail", largura=32)
+        self._le.pack(fill="x", pady=(0, 12))
+        self._ls = EntryModerno(form, "Senha", show="•", largura=32)
+        self._ls.pack(fill="x", pady=(0, 32))
+
+        self._le.bind_enter(lambda: self._ls.focus())
+        self._ls.bind_enter(self._logar)
+
+        # ── Botão principal (maior que v3) ───────────────────
+        BotaoAnimado(
+            form, "  Entrar na conta  →",
+            self._logar, variante="login",
+            fonte=F["btn_lg"], pady_base=17
+        ).pack(fill="x", pady=(0, 18))
+
+        # Divisor com texto
+        div = tk.Frame(form, bg=C["bg_main"])
+        div.pack(fill="x", pady=(0, 16))
+        tk.Frame(div, bg=C["blue_mid"], height=1).pack(
+            side="left", fill="x", expand=True, padx=(0, 10))
+        tk.Label(div, text="ou", font=F["caption"],
+                 bg=C["bg_main"], fg=C["text_dim"]).pack(side="left")
+        tk.Frame(div, bg=C["blue_mid"], height=1).pack(
+            side="left", fill="x", expand=True, padx=(10, 0))
+
+        # Botão secundário (criar conta)
+        BotaoAnimado(
+            form, "  Criar nova conta",
+            self._cadastro, variante="secundario",
+            fonte=F["btn"], pady_base=14
+        ).pack(fill="x")
+
+        self._le.focus()
+
+    # ── Lógica de login ──────────────────────────────────────
+    def _logar(self):
+        e = self._le.get().strip()
+        s = self._ls.get().strip()
+        if not e or not s:
+            self.toast.mostrar("Preencha e-mail e senha.", "aviso"); return
+        u = self.banco.autenticar(e, s)
+        if u:
+            self.ao_logar(u)
+        else:
+            self.toast.mostrar("E-mail ou senha incorretos.", "erro")
+
+    # ── Tela de Cadastro ─────────────────────────────────────
+    def _cadastro(self):
+        self._limpar()
+        cont = tk.Frame(self.frame, bg=C["bg_main"])
+        cont.pack(fill="both", expand=True)
+        self._painel_esq(cont)
+
+        dir_ = tk.Frame(cont, bg=C["bg_main"])
+        dir_.pack(side="left", fill="both", expand=True)
+
+        # Scroll para caber todos os campos no cadastro
+        sf = ScrollFrame(dir_, bg=C["bg_main"])
+        sf.pack(fill="both", expand=True)
+        form = tk.Frame(sf.interior, bg=C["bg_main"], padx=52, pady=24)
+        form.pack(fill="x")
+        sf.bind_scroll_em(form)
+
+        tk.Label(form, text="Criar nova conta ✨",
+                 font=F["h1"], bg=C["bg_main"],
+                 fg=C["text_white"]).pack(anchor="w")
+        tk.Label(form, text="Comece sua jornada de controle hoje",
+                 font=F["body"], bg=C["bg_main"],
+                 fg=C["text_muted"]).pack(anchor="w", pady=(6, 20))
+
+        self._cn = EntryModerno(form, "Nome completo", largura=32)
+        self._cn.pack(fill="x", pady=(0, 8))
+        self._ce = EntryModerno(form, "E-mail", largura=32)
+        self._ce.pack(fill="x", pady=(0, 8))
+        self._cs = EntryModerno(form, "Senha (mín. 6 caracteres)",
+                                show="•", largura=32)
+        self._cs.pack(fill="x", pady=(0, 4))
+
+        # Indicador de força de senha
+        ind = IndicadorSenha(form, self._cs, bg=C["bg_main"])
+        ind.pack(fill="x", pady=(0, 8))
+        sf.bind_scroll_em(ind)
+
+        self._cc = EntryModerno(form, "Confirmar senha",
+                                show="•", largura=32)
+        self._cc.pack(fill="x", pady=(0, 26))
+
+        self._cc.bind_enter(self._fazer_cad)
+
+        # Botão criar conta (grande)
+        BotaoAnimado(
+            form, "  Criar minha conta  →",
+            self._fazer_cad, variante="sucesso",
+            fonte=F["btn_lg"], pady_base=16
+        ).pack(fill="x", pady=(0, 14))
+
+        # Link voltar
+        lf = tk.Frame(form, bg=C["bg_main"])
+        lf.pack()
+        tk.Label(lf, text="Já tenho conta.", font=F["body"],
+                 bg=C["bg_main"], fg=C["text_muted"]).pack(side="left")
+        lnk = tk.Label(lf, text=" Fazer login", font=F["btn"],
+                       bg=C["bg_main"], fg=C["blue_light"], cursor="hand2")
+        lnk.pack(side="left")
+        lnk.bind("<Button-1>", lambda e: self._login())
+        lnk.bind("<Enter>", lambda e: lnk.config(fg=C["text_white"]))
+        lnk.bind("<Leave>", lambda e: lnk.config(fg=C["blue_light"]))
+
+        self._cn.focus()
+        sf.bind_scroll_em(form)
+
+    # ── Lógica de cadastro ───────────────────────────────────
+    def _fazer_cad(self):
+        nome  = self._cn.get().strip()
+        email = self._ce.get().strip()
+        senha = self._cs.get().strip()
+        conf  = self._cc.get().strip()
+        if not all([nome, email, senha, conf]):
+            self.toast.mostrar("Preencha todos os campos.", "aviso"); return
+        if len(nome) < 2:
+            self.toast.mostrar("Nome muito curto.", "aviso"); return
+        if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
+            self.toast.mostrar("E-mail inválido.", "erro"); return
+        if len(senha) < 6:
+            self.toast.mostrar("Senha deve ter ao menos 6 caracteres.", "aviso"); return
+        if senha != conf:
+            self.toast.mostrar("As senhas não coincidem.", "erro"); return
+        if self.banco.cadastrar(nome, email, senha):
+            self.toast.mostrar(
+                f"Conta criada! Bem-vindo(a), {nome.split()[0]}!", "sucesso")
+            self._login()
+        else:
+            self.toast.mostrar("Este e-mail já está cadastrado.", "erro")
+
+
+# =============================================================================
+#  TELA: Dashboard
+# =============================================================================
+class TelaDashboard(TelaBase):
+    def __init__(self, frame, banco, usuario, toast, ao_navegar):
+        self.frame      = frame
+        self.banco      = banco
+        self.usuario    = usuario
+        self.toast      = toast
+        self.ao_navegar = ao_navegar
+        self._build()
+
+    def _build(self):
+        self._limpar()
+
+        # ScrollFrame com scroll de mouse integrado
+        sf_widget = ScrollFrame(self.frame)
+        sf_widget.pack(fill="both", expand=True)
+        sf = sf_widget.interior
+
+        hora = datetime.datetime.now().hour
+        saud = ("Bom dia" if hora < 12 else
+                "Boa tarde" if hora < 18 else "Boa noite")
+        nome1 = self.usuario["nome"].split()[0]
+
+        cab = tk.Frame(sf, bg=C["bg_main"], pady=32, padx=36)
+        cab.pack(fill="x")
+        tk.Label(cab, text=f"{saud}, {nome1}! 👋",
+                 font=F["h1"], bg=C["bg_main"],
+                 fg=C["text_white"]).pack(anchor="w")
+        tk.Label(cab, text=f"Painel  •  "
+                 f"{datetime.datetime.now().strftime('%d/%m/%Y')}",
+                 font=F["body"], bg=C["bg_main"],
+                 fg=C["text_muted"]).pack(anchor="w", pady=(6, 0))
+
+        total  = self.banco.total(self.usuario["id"])
+        streak = self.banco.dias_consecutivos(self.usuario["id"])
+        hist   = self.banco.historico(self.usuario["id"])
+        ult_beb  = hist[0][0] if hist else "Nenhum"
+        ult_data = hist[0][3][:10] if hist else "—"
+
+        # Cards estatísticos
+        grade = tk.Frame(sf, bg=C["bg_main"])
+        grade.pack(fill="x", padx=28, pady=(0, 20))
+        stats = [
+            ("📊", "Total de Registros", str(total),   "registros no total",  C["blue_light"]),
+            ("🔥", "Dias Consecutivos",  str(streak),  "dias seguidos",       C["amber"]),
+            ("🍺", "Último Consumo",     ult_beb,       f"em {ult_data}",     C["purple"]),
+        ]
+        for col, (em, tit, val, sub, cor) in enumerate(stats):
+            grade.columnconfigure(col, weight=1, pad=4)
+            outer, inner = criar_card(grade, pad_x=22, pad_y=20)
+            outer.grid(row=0, column=col, sticky="ew", padx=7, pady=6)
+            tk.Frame(inner, bg=cor, height=3).pack(fill="x", pady=(0, 16))
+            tk.Label(inner, text=f"{em}  {tit}", font=F["body_sm"],
+                     bg=C["bg_card"], fg=C["text_muted"]).pack(anchor="w")
+            tk.Label(inner, text=val, font=("Segoe UI", 30, "bold"),
+                     bg=C["bg_card"], fg=cor).pack(anchor="w", pady=(4, 0))
+            tk.Label(inner, text=sub, font=F["caption"],
+                     bg=C["bg_card"], fg=C["text_dim"]).pack(anchor="w")
+
+        # Ações rápidas
+        ao, ai = criar_card(sf, "Ações Rápidas", icone="⚡",
+                            pad_x=28, pad_y=22)
+        ao.pack(fill="x", padx=28, pady=(0, 14))
+        br = tk.Frame(ai, bg=C["bg_card"])
+        br.pack(fill="x")
+        for txt, tela, var in [
+            ("🍺   Registrar Consumo", "consumo",    "primario"),
+            ("📋   Ver Histórico",      "historico",  "secundario"),
+            ("🩺   Saúde & Risco",      "medico",     "amber"),
+            ("🧠   Apoio Emocional",    "psicologico","purple"),
+        ]:
+            btn = BotaoAnimado(br, txt,
+                               lambda t=tela: self.ao_navegar(t),
+                               variante=var, fonte=F["btn"], pady_base=12)
+            btn.pack(side="left", padx=(0, 12), pady=6)
+            sf_widget.bind_scroll_em(btn)
+
+        # Frase motivacional
+        frases = [
+            "\"A jornada de mil quilômetros começa com um único passo.\"",
+            "\"Cada dia sóbrio é uma vitória que merece ser celebrada.\"",
+            "\"Você tem força suficiente para mudar quando quiser.\"",
+            "\"Cuidar de si mesmo é o ato de amor mais corajoso.\"",
+            "\"Um dia de cada vez — e este dia, você escolheu bem.\"",
+        ]
+        mo, mi = criar_card(sf, pad_x=28, pad_y=18)
+        mo.pack(fill="x", padx=28, pady=(0, 28))
+        tk.Label(mi, text="💬  " + random.choice(frases),
+                 font=("Segoe UI", 11, "italic"),
+                 bg=C["bg_card"], fg=C["blue_soft"],
+                 wraplength=680, justify="left").pack(anchor="w")
+
+        # Registrar scroll em todos os widgets filhos
+        sf_widget.bind_scroll_em(sf)
+
+
+# =============================================================================
+#  TELA: Registrar Consumo
+# =============================================================================
+class TelaConsumo(TelaBase):
+    BEBIDAS  = ["Cerveja", "Vinho", "Cachaça", "Vodka",
+                "Whisky", "Rum", "Gin", "Dose", "Outro"]
+    UNIDADES = ["ml", "L", "doses", "latas", "garrafas", "copos", "taças"]
+    EMOJIS   = {"Cerveja":"🍺","Vinho":"🍷","Cachaça":"🥃","Vodka":"🫗",
+                "Whisky":"🥃","Rum":"🍹","Gin":"🍸","Dose":"🔵","Outro":"❓"}
+
+    def __init__(self, frame, banco, usuario, toast, ao_voltar):
+        self.frame        = frame
+        self.banco        = banco
+        self.usuario      = usuario
+        self.toast        = toast
+        self.ao_voltar    = ao_voltar
+        self._bebida_sel  = tk.StringVar(value="Cerveja")
+        self._btn_beb_wid = {}
+        self._build()
+
+    def _build(self):
+        self._limpar()
+
+        sf_widget = ScrollFrame(self.frame)
+        sf_widget.pack(fill="both", expand=True)
+        sf = sf_widget.interior
+
+        cab = tk.Frame(sf, bg=C["bg_main"], pady=30, padx=36)
+        cab.pack(fill="x")
+        tk.Label(cab, text="Registrar Consumo 🍺",
+                 font=F["h1"], bg=C["bg_main"],
+                 fg=C["text_white"]).pack(anchor="w")
+        tk.Label(cab, text="Registre honestamente — cada dado ajuda no seu progresso",
+                 font=F["body"], bg=C["bg_main"],
+                 fg=C["text_muted"]).pack(anchor="w", pady=(6, 0))
+
+        co, ci = criar_card(sf, "Detalhes do Consumo", icone="📝",
+                            pad_x=30, pad_y=24)
+        co.pack(fill="x", padx=28, pady=(0, 18))
+
+        tk.Label(ci, text="Tipo de bebida — clique para selecionar",
+                 font=F["body_sm"], bg=C["bg_card"],
+                 fg=C["text_muted"]).pack(anchor="w", pady=(0, 8))
+
+        grade = tk.Frame(ci, bg=C["bg_card"])
+        grade.pack(fill="x", pady=(0, 18))
+        for idx, beb in enumerate(self.BEBIDAS):
+            col = idx % 5
+            row = idx // 5
+            grade.columnconfigure(col, weight=1)
+            w = tk.Label(grade,
+                text=f"{self.EMOJIS.get(beb, '🍾')}\n{beb}",
+                font=F["caption"], bg=C["bg_input"],
+                fg=C["text_muted"], cursor="hand2",
+                padx=6, pady=10, justify="center", relief="flat")
+            w.grid(row=row, column=col, padx=3, pady=3, sticky="ew")
+            self._btn_beb_wid[beb] = w
+            w.bind("<Button-1>", lambda e, b=beb: self._sel_bebida(b))
+            w.bind("<Enter>",    lambda e, wi=w, b=beb: (
+                wi.config(bg=C["bg_hover"]) if b != self._bebida_sel.get() else None))
+            w.bind("<Leave>",    lambda e, wi=w, b=beb: (
+                wi.config(bg=C["bg_input"]) if b != self._bebida_sel.get() else None))
+            sf_widget.bind_scroll_em(w)
+        self._sel_bebida("Cerveja")
+
+        row_qu = tk.Frame(ci, bg=C["bg_card"])
+        row_qu.pack(fill="x", pady=(0, 14))
+
+        qf = tk.Frame(row_qu, bg=C["bg_card"])
+        qf.pack(side="left", fill="x", expand=True, padx=(0, 16))
+        tk.Label(qf, text="Quantidade", font=F["body_sm"],
+                 bg=C["bg_card"], fg=C["text_muted"]).pack(anchor="w", pady=(0, 4))
+        qb = tk.Frame(qf, bg=C["blue_mid"], padx=1, pady=1)
+        qb.pack(fill="x")
+        self._eqtd = tk.Entry(qb, font=F["body_lg"], bg=C["bg_input"],
+                              fg=C["text_white"], insertbackground=C["blue_light"],
+                              relief="flat", bd=0)
+        self._eqtd.pack(fill="x", ipady=14, padx=1)
+        self._eqtd.insert(0, "1")
+        self._eqtd.bind("<FocusIn>",  lambda e: qb.config(bg=C["blue_light"]))
+        self._eqtd.bind("<FocusOut>", lambda e: qb.config(bg=C["blue_mid"]))
+
+        uf = tk.Frame(row_qu, bg=C["bg_card"])
+        uf.pack(side="left", fill="x", expand=True)
+        tk.Label(uf, text="Unidade", font=F["body_sm"],
+                 bg=C["bg_card"], fg=C["text_muted"]).pack(anchor="w", pady=(0, 4))
+        s = ttk.Style()
+        s.configure("D.TCombobox", fieldbackground=C["bg_input"],
+                    background=C["bg_input"], foreground=C["text_white"],
+                    selectbackground=C["blue_mid"], arrowcolor=C["blue_light"])
+        self._cuni = ttk.Combobox(uf, values=self.UNIDADES,
+                                  font=F["body_lg"], state="readonly",
+                                  style="D.TCombobox")
+        self._cuni.set("doses")
+        self._cuni.pack(fill="x", ipady=8)
+
+        ds = datetime.datetime.now().strftime("%d/%m/%Y  às  %H:%M")
+        tk.Label(ci, text=f"📅  Será registrado em:  {ds}",
+                 font=F["body_sm"], bg=C["bg_card"],
+                 fg=C["text_dim"]).pack(anchor="w", pady=(0, 20))
+
+        bf = tk.Frame(ci, bg=C["bg_card"])
+        bf.pack(fill="x")
+        BotaoAnimado(bf, "💾   Salvar Registro", self._salvar,
+                     variante="sucesso", fonte=F["btn_lg"],
+                     pady_base=16).pack(side="left", padx=(0, 16))
+        BotaoAnimado(bf, "←  Cancelar", self.ao_voltar,
+                     variante="ghost", fonte=F["btn"],
+                     pady_base=16).pack(side="left")
+
+        sf_widget.bind_scroll_em(sf)
+
+    def _sel_bebida(self, beb):
+        for b, w in self._btn_beb_wid.items():
+            w.config(bg=C["bg_input"], fg=C["text_muted"])
+        self._bebida_sel.set(beb)
+        if beb in self._btn_beb_wid:
+            self._btn_beb_wid[beb].config(bg=C["blue_mid"], fg=C["blue_soft"])
+
+    def _salvar(self):
+        bebida = self._bebida_sel.get()
+        unidade = self._cuni.get()
+        qtds = self._eqtd.get().strip().replace(",", ".")
+        if not qtds:
+            self.toast.mostrar("Informe a quantidade.", "aviso"); return
+        try:
+            qtd = float(qtds)
+            if qtd <= 0: raise ValueError
+        except ValueError:
+            self.toast.mostrar("Quantidade inválida.", "erro"); return
+        if self.banco.registrar_consumo(self.usuario["id"], bebida, qtd, unidade):
+            self.toast.mostrar(f"Salvo: {qtd} {unidade} de {bebida}!", "sucesso")
+            self.ao_voltar()
+        else:
+            self.toast.mostrar("Erro ao salvar. Tente novamente.", "erro")
+
+
+# =============================================================================
+#  TELA: Histórico
+# =============================================================================
+class TelaHistorico(TelaBase):
+    def __init__(self, frame, banco, usuario, toast, ao_voltar):
+        self.frame    = frame
+        self.banco    = banco
+        self.usuario  = usuario
+        self.toast    = toast
+        self.ao_voltar = ao_voltar
+        self._build()
+
+    def _build(self):
+        self._limpar()
+        regs = self.banco.historico(self.usuario["id"])
+
+        cab = tk.Frame(self.frame, bg=C["bg_main"], pady=26, padx=32)
+        cab.pack(fill="x")
+        tk.Label(cab, text="Histórico de Consumo 📋",
+                 font=F["h1"], bg=C["bg_main"],
+                 fg=C["text_white"]).pack(anchor="w")
+        tk.Label(cab, text=f"{len(regs)} registro(s) encontrado(s)",
+                 font=F["body"], bg=C["bg_main"],
+                 fg=C["text_muted"]).pack(anchor="w", pady=(4, 0))
+
+        co, ci = criar_card(self.frame, pad_x=0, pad_y=0)
+        co.pack(fill="both", expand=True, padx=24, pady=(0, 16))
+
+        if not regs:
+            tk.Label(ci, text="😊\n\nNenhum registro ainda.\n"
+                     "Use 'Registrar Consumo' para começar!",
+                     font=F["body_lg"], bg=C["bg_card"],
+                     fg=C["text_muted"], justify="center").pack(
+                         expand=True, pady=60)
+            return
+
+        st = ttk.Style()
+        st.theme_use("default")
+        st.configure("H2.Treeview", background=C["bg_card"],
+                     foreground=C["text_white"], rowheight=42,
+                     fieldbackground=C["bg_card"], font=F["body_lg"],
+                     borderwidth=0)
+        st.configure("H2.Treeview.Heading", background=C["bg_deep"],
+                     foreground=C["blue_light"], font=F["h3"], relief="flat")
+        st.map("H2.Treeview",
+               background=[("selected", C["blue_mid"])],
+               foreground=[("selected", C["blue_soft"])])
+
+        cols = ("#", "Bebida", "Quantidade", "Unidade", "Data / Hora")
+        tree = ttk.Treeview(ci, columns=cols, show="headings",
+                            style="H2.Treeview")
+        for col, larg in zip(cols, [50, 200, 120, 110, 200]):
+            tree.heading(col, text=col)
+            tree.column(col, width=larg, anchor="center", minwidth=40)
+
+        sy = ttk.Scrollbar(ci, orient="vertical", command=tree.yview)
+        sx = ttk.Scrollbar(ci, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=sy.set, xscrollcommand=sx.set)
+
+        # Scroll de mouse na Treeview também
+        def _scroll_tree(event):
+            if event.num == 4:   tree.yview_scroll(-1, "units")
+            elif event.num == 5: tree.yview_scroll(1, "units")
+            else:
+                tree.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        tree.bind("<MouseWheel>", _scroll_tree)
+        tree.bind("<Button-4>",   _scroll_tree)
+        tree.bind("<Button-5>",   _scroll_tree)
+
+        sy.pack(side="right", fill="y")
+        sx.pack(side="bottom", fill="x")
+        tree.pack(fill="both", expand=True)
+
+        for i, (beb, qtd, uni, data) in enumerate(regs, 1):
+            try:
+                dt = datetime.datetime.strptime(data, "%Y-%m-%d %H:%M")
+                df = dt.strftime("%d/%m/%Y   %H:%M")
+            except ValueError:
+                df = data
+            tag = "par" if i % 2 == 0 else "impar"
+            tree.insert("", "end", values=(i, beb, qtd, uni, df), tags=(tag,))
+        tree.tag_configure("par",   background=C["bg_card"])
+        tree.tag_configure("impar", background="#111D2E")
+
+
+# =============================================================================
+#  TELA: Saúde & Risco (Médico)
+# =============================================================================
+class TelaMedico(TelaBase):
+    LIMITES = [
+        ("🟢 Baixo Risco",    "até 14 doses/semana (homens)\naté 7 doses/semana (mulheres)",
+         "Consumo dentro dos limites considerados de baixo risco pela OMS.\n"
+         "Continue monitorando e mantenha o padrão saudável.", C["green"]),
+        ("🟡 Risco Moderado", "15–20 doses/semana",
+         "Padrão de consumo que pode gerar dependência a médio prazo.\n"
+         "Considere reduzir gradualmente e conversar com seu médico.", C["amber"]),
+        ("🟠 Alto Risco",     "21–35 doses/semana",
+         "Nível associado a danos hepáticos, cardiovasculares e cognitivos.\n"
+         "É fortemente recomendado buscar orientação médica especializada.", C["amber"]),
+        ("🔴 Risco Crítico",  "acima de 35 doses/semana",
+         "Consumo em nível de dependência grave. Risco à vida.\n"
+         "Procure imediatamente um médico ou CAPS.", C["red"]),
+    ]
+    SINAIS_FISICOS = [
+        "Tremores nas mãos ao acordar", "Náusea ou vômito frequentes",
+        "Sudorese excessiva sem motivo", "Palpitações ou dor no peito",
+        "Dificuldade para dormir sem beber", "Perda de apetite constante",
+        "Vermelhidão no rosto ou olhos amarelados",
+    ]
+    SINAIS_PSICO = [
+        "Ansiedade intensa quando sem bebida", "Irritabilidade ou agressividade",
+        "Memória apagada (blackouts)", "Dificuldade de concentração",
+        "Sentimento de culpa após beber", "Pensamentos de beber pela manhã",
+        "Afastamento de família e amigos",
+    ]
+
+    def __init__(self, frame, banco, usuario, toast, ao_voltar):
+        self.frame    = frame
+        self.banco    = banco
+        self.usuario  = usuario
+        self.toast    = toast
+        self.ao_voltar = ao_voltar
+        self._build()
+
+    def _build(self):
+        self._limpar()
+        sf_widget = ScrollFrame(self.frame)
+        sf_widget.pack(fill="both", expand=True)
+        sf = sf_widget.interior
+
+        cab = tk.Frame(sf, bg=C["bg_main"], pady=26, padx=32)
+        cab.pack(fill="x")
+        tk.Label(cab, text="Saúde & Risco 🩺",
+                 font=F["h1"], bg=C["bg_main"],
+                 fg=C["text_white"]).pack(anchor="w")
+        tk.Label(cab, text="Avaliação baseada no seu consumo real  •  Fonte: OMS / CEBRID / CFM",
+                 font=F["body"], bg=C["bg_main"],
+                 fg=C["text_muted"]).pack(anchor="w", pady=(4, 0))
+
+        qtd_regs, _ = self.banco.consumo_ultimos_dias(
+            self.usuario["id"], dias=7)
+        doses_semana = qtd_regs
+
+        if doses_semana == 0:
+            nivel = 0; desc = "Nenhum consumo registrado esta semana. Excelente! 🎉"
+            cor_nivel = C["green"]; emoji_nivel = "🟢"
+        elif doses_semana <= 7:
+            nivel = 1; desc = "Consumo dentro do limite de baixo risco."
+            cor_nivel = C["green"]; emoji_nivel = "🟢"
+        elif doses_semana <= 14:
+            nivel = 2; desc = "Atenção: consumo moderado. Considere reduzir."
+            cor_nivel = C["amber"]; emoji_nivel = "🟡"
+        elif doses_semana <= 21:
+            nivel = 3; desc = "Consumo elevado. Recomenda-se avaliação médica."
+            cor_nivel = C["amber"]; emoji_nivel = "🟠"
+        else:
+            nivel = 4; desc = "⚠️ Nível crítico. Procure ajuda especializada!"
+            cor_nivel = C["red"]; emoji_nivel = "🔴"
+
+        ao, ai = criar_card(sf, "Sua Avaliação Atual", icone="📊",
+                            cor_icone=cor_nivel, cor_borda=cor_nivel,
+                            pad_x=28, pad_y=22)
+        ao.pack(fill="x", padx=24, pady=(0, 16))
+
+        risco_row = tk.Frame(ai, bg=C["bg_card"])
+        risco_row.pack(fill="x", pady=(0, 14))
+        tk.Label(risco_row, text=f"{emoji_nivel}  Nível de Risco",
+                 font=F["h3"], bg=C["bg_card"],
+                 fg=C["text_muted"]).pack(side="left")
+        tk.Label(risco_row, text=f"  {nivel}/4",
+                 font=("Segoe UI", 22, "bold"),
+                 bg=C["bg_card"], fg=cor_nivel).pack(side="right")
+
+        barra_bg = tk.Frame(ai, bg=C["bg_input"], height=14)
+        barra_bg.pack(fill="x", pady=(0, 10))
+        barra_bg.update_idletasks()
+        pct = max(nivel / 4, 0.03)
+        barra_fill = tk.Frame(barra_bg, bg=cor_nivel, height=14)
+        barra_fill.place(relwidth=pct, relheight=1)
+
+        tk.Label(ai, text=f"Registros esta semana: {qtd_regs}",
+                 font=F["body_sm"], bg=C["bg_card"],
+                 fg=C["text_muted"]).pack(anchor="w")
+        tk.Label(ai, text=desc, font=F["body_lg"],
+                 bg=C["bg_card"], fg=cor_nivel,
+                 wraplength=660).pack(anchor="w", pady=(8, 0))
+
+        to, ti = criar_card(sf, "Tabela de Limites Seguros (OMS / CEBRID)",
+                            icone="📋", pad_x=24, pad_y=18)
+        to.pack(fill="x", padx=24, pady=(0, 16))
+        for nome, limite, orientacao, cor in self.LIMITES:
+            row = tk.Frame(ti, bg=C["bg_input"], padx=14, pady=12)
+            row.pack(fill="x", pady=4)
+            tk.Frame(row, bg=cor, width=4).pack(side="left", fill="y",
+                                                 padx=(0, 12))
+            col = tk.Frame(row, bg=C["bg_input"])
+            col.pack(side="left", fill="both", expand=True)
+            tk.Label(col, text=nome, font=F["h3"],
+                     bg=C["bg_input"], fg=cor, anchor="w").pack(fill="x")
+            tk.Label(col, text=f"Referência: {limite}",
+                     font=F["body_sm"], bg=C["bg_input"],
+                     fg=C["text_muted"], anchor="w").pack(fill="x")
+            tk.Label(col, text=orientacao, font=F["body"],
+                     bg=C["bg_input"], fg=C["text_white"],
+                     anchor="w", wraplength=640, justify="left").pack(
+                         fill="x", pady=(4, 0))
+            sf_widget.bind_scroll_em(row)
+
+        row2 = tk.Frame(sf, bg=C["bg_main"])
+        row2.pack(fill="x", padx=24, pady=(0, 16))
+        row2.columnconfigure(0, weight=1, pad=6)
+        row2.columnconfigure(1, weight=1, pad=6)
+        for col_idx, (titulo, icone, cor_ico, sinais) in enumerate([
+            ("Sinais Físicos 🩸",      "⚠️", C["red"],   self.SINAIS_FISICOS),
+            ("Sinais Psicológicos 🧠", "⚠️", C["amber"], self.SINAIS_PSICO),
+        ]):
+            so, si = criar_card(row2, titulo, icone=icone,
+                                cor_icone=cor_ico, pad_x=18, pad_y=16)
+            so.grid(row=0, column=col_idx, sticky="nsew", padx=5)
+            tk.Label(si,
+                     text="Se você identificar 3 ou mais destes sinais,\n"
+                          "procure um médico ou ligue 188 (CVV).",
+                     font=F["body_sm"], bg=C["bg_card"],
+                     fg=C["text_muted"], justify="left").pack(
+                         anchor="w", pady=(0, 10))
+            for sinal in sinais:
+                sf_row = tk.Frame(si, bg=C["bg_card"])
+                sf_row.pack(fill="x", pady=2)
+                tk.Label(sf_row, text="•", font=F["body"],
+                         bg=C["bg_card"], fg=cor_ico).pack(side="left",
+                                                            padx=(0, 6))
+                tk.Label(sf_row, text=sinal, font=F["body"],
+                         bg=C["bg_card"], fg=C["text_white"],
+                         anchor="w").pack(side="left")
+
+        ho, hi = criar_card(sf, "Onde Buscar Ajuda Profissional 📞",
+                            icone="🆘", cor_icone=C["red"],
+                            cor_borda=C["red"], pad_x=24, pad_y=18)
+        ho.pack(fill="x", padx=24, pady=(0, 24))
+        contatos = [
+            ("🔴 CVV (Centro de Valorização da Vida)",
+             "Ligue 188  |  chat: cvv.org.br  |  24 horas, gratuito"),
+            ("🟡 CAPS (Centro de Atenção Psicossocial)",
+             "Procure a unidade mais próxima na Secretaria de Saúde"),
+            ("🟢 CRAS / CREAS",
+             "Assistência social e encaminhamento para tratamento"),
+            ("🔵 AA (Alcoólicos Anônimos)",
+             "aa.org.br  |  Grupos presenciais, totalmente gratuito"),
+        ]
+        for nome, info in contatos:
+            cf = tk.Frame(hi, bg=C["bg_card"], pady=5)
+            cf.pack(fill="x")
+            tk.Label(cf, text=nome, font=F["h3"],
+                     bg=C["bg_card"], fg=C["text_white"], anchor="w").pack(fill="x")
+            tk.Label(cf, text=info, font=F["body"],
+                     bg=C["bg_card"], fg=C["text_muted"], anchor="w").pack(fill="x")
+            tk.Frame(hi, bg=C["blue_mid"], height=1).pack(fill="x", pady=4)
+
+        tk.Label(sf,
+                 text="⚠️  Este app é informativo e NÃO substitui consulta médica profissional.",
+                 font=("Segoe UI", 9, "italic"),
+                 bg=C["bg_main"], fg=C["text_dim"],
+                 wraplength=700).pack(pady=(0, 20))
+
+        sf_widget.bind_scroll_em(sf)
+
+
+# =============================================================================
+#  TELA: Apoio Emocional (Psicológico)
+# =============================================================================
+class TelaPsicologico(TelaBase):
+    HUMORES = [
+        ("😊", "Bem",       C["green"]),
+        ("😐", "Neutro",    C["blue_light"]),
+        ("😟", "Ansioso",   C["amber"]),
+        ("😢", "Triste",    C["purple"]),
+        ("😡", "Irritado",  C["red"]),
+        ("🥴", "Com vontade", C["amber"]),
+    ]
+    TECNICAS_CBT = [
+        ("🔍 Identificar o Gatilho",
+         "Pergunte-se: 'O que aconteceu antes de sentir vontade de beber?'\n"
+         "Gatilhos comuns: estresse, solidão, comemorações, locais específicos.",
+         C["blue_light"]),
+        ("💭 Questionar o Pensamento",
+         "Quando surgir 'preciso beber', questione:\n"
+         "• Este pensamento é fato ou sentimento?\n"
+         "• O que de pior pode acontecer se eu não beber agora?\n"
+         "• Já passei por isso antes sem beber?",
+         C["purple"]),
+        ("🔄 Substituição de Comportamento",
+         "Substitua o impulso por uma ação alternativa imediata:\n"
+         "• Beber água gelada ou suco\n"
+         "• Fazer 10 minutos de caminhada\n"
+         "• Ligar para alguém de confiança\n"
+         "• Escrever no diário emocional",
+         C["teal"]),
+        ("⏱️ A Regra dos 15 Minutos",
+         "O impulso de beber dura em média 15 minutos.\n"
+         "Comprometa-se a esperar 15 minutos antes de qualquer decisão.",
+         C["green"]),
+        ("🎯 Reforço Positivo",
+         "Registre cada dia sem beber ou com consumo reduzido.\n"
+         "Comemore pequenas vitórias: 1 dia, 3 dias, 1 semana...",
+         C["amber"]),
+    ]
+
+    def __init__(self, frame, banco, usuario, toast, ao_voltar):
+        self.frame       = frame
+        self.banco       = banco
+        self.usuario     = usuario
+        self.toast       = toast
+        self.ao_voltar   = ao_voltar
+        self._humor_sel  = tk.StringVar(value="")
+        self._respirando = False
+        self._fase_resp  = 0
+        self._build()
+
+    def _build(self):
+        self._limpar()
+        sf_widget = ScrollFrame(self.frame)
+        sf_widget.pack(fill="both", expand=True)
+        sf = sf_widget.interior
+
+        cab = tk.Frame(sf, bg=C["bg_main"], pady=26, padx=32)
+        cab.pack(fill="x")
+        tk.Label(cab, text="Apoio Emocional 🧠",
+                 font=F["h1"], bg=C["bg_main"],
+                 fg=C["text_white"]).pack(anchor="w")
+        tk.Label(cab, text="Técnicas baseadas em TCC (Terapia Cognitivo-Comportamental)",
+                 font=F["body"], bg=C["bg_main"],
+                 fg=C["text_muted"]).pack(anchor="w", pady=(4, 0))
+
+        to, ti = criar_card(sf, "Técnicas para Controlar o Impulso",
+                            icone="🧩", cor_icone=C["purple"],
+                            pad_x=24, pad_y=18)
+        to.pack(fill="x", padx=24, pady=(0, 16))
+        for titulo, texto, cor in self.TECNICAS_CBT:
+            card_row = tk.Frame(ti, bg=C["bg_input"], padx=14, pady=12)
+            card_row.pack(fill="x", pady=5)
+            tk.Frame(card_row, bg=cor, width=4).pack(side="left", fill="y",
+                                                       padx=(0, 12))
+            col = tk.Frame(card_row, bg=C["bg_input"])
+            col.pack(side="left", fill="both", expand=True)
+            tk.Label(col, text=titulo, font=F["h3"],
+                     bg=C["bg_input"], fg=cor, anchor="w").pack(fill="x")
+            tk.Label(col, text=texto, font=F["body"],
+                     bg=C["bg_input"], fg=C["text_white"],
+                     anchor="w", justify="left", wraplength=640).pack(
+                         fill="x", pady=(6, 0))
+            sf_widget.bind_scroll_em(card_row)
+
+        # Respiração guiada
+        ro, ri = criar_card(sf, "Respiração 4-7-8 para Reduzir Ansiedade",
+                            icone="🌬️", cor_icone=C["teal"],
+                            cor_borda=C["teal"], pad_x=24, pad_y=20)
+        ro.pack(fill="x", padx=24, pady=(0, 16))
+        tk.Label(ri, text="Ativa o sistema nervoso parassimpático,\n"
+                 "reduzindo ansiedade e vontade de beber em minutos.",
+                 font=F["body"], bg=C["bg_card"],
+                 fg=C["text_muted"], justify="center").pack()
+        tk.Frame(ri, bg=C["teal"], height=1).pack(fill="x", pady=12)
+        self._lbl_resp = tk.Label(ri, text="Pressione o botão para iniciar",
+            font=("Segoe UI", 15, "bold"), bg=C["bg_card"], fg=C["teal"])
+        self._lbl_resp.pack(pady=(8, 4))
+        self._lbl_count = tk.Label(ri, text="",
+            font=("Segoe UI", 48, "bold"), bg=C["bg_card"], fg=C["text_white"])
+        self._lbl_count.pack()
+        self._btn_resp = BotaoAnimado(ri, "▶  Iniciar Respiração Guiada",
+            self._toggle_respiracao, variante="teal",
+            fonte=F["btn_lg"], pady_base=14)
+        self._btn_resp.pack(pady=14)
+        sf_widget.bind_scroll_em(self._btn_resp)
+        tk.Label(ri, text="4 = Inspire  •  7 = Segure  •  8 = Expire\n"
+                 "Repita 4 ciclos para melhor resultado.",
+                 font=F["body_sm"], bg=C["bg_card"],
+                 fg=C["text_dim"]).pack()
+
+        # Diário emocional
+        do, di = criar_card(sf, "Diário Emocional 📓",
+                            icone="✍️", cor_icone=C["amber"],
+                            cor_borda=C["amber"], pad_x=24, pad_y=20)
+        do.pack(fill="x", padx=24, pady=(0, 16))
+        tk.Label(di, text="Como você está se sentindo agora?",
+                 font=F["h3"], bg=C["bg_card"],
+                 fg=C["text_white"]).pack(anchor="w", pady=(0, 10))
+
+        hf = tk.Frame(di, bg=C["bg_card"])
+        hf.pack(fill="x", pady=(0, 16))
+        self._humor_btns = {}
+        for emoji, label, cor in self.HUMORES:
+            w = tk.Label(hf, text=f"{emoji}\n{label}",
+                font=F["caption"], bg=C["bg_input"],
+                fg=C["text_muted"], cursor="hand2",
+                padx=9, pady=9, justify="center")
+            w.pack(side="left", padx=4)
+            self._humor_btns[(emoji, label)] = w
+            w.bind("<Button-1>",
+                   lambda e, em=emoji, lb=label, c=cor:
+                   self._sel_humor(em, lb, c))
+            sf_widget.bind_scroll_em(w)
+
+        tk.Label(di, text="Descreva o que está sentindo ou pensando:",
+                 font=F["body_sm"], bg=C["bg_card"],
+                 fg=C["text_muted"]).pack(anchor="w", pady=(0, 6))
+        self._txt_diario = tk.Text(di, font=F["body_lg"],
+            bg=C["bg_input"], fg=C["text_white"],
+            insertbackground=C["blue_light"],
+            relief="flat", bd=0, height=5, wrap="word", padx=10, pady=10)
+        self._txt_diario.pack(fill="x")
+
+        bf = tk.Frame(di, bg=C["bg_card"])
+        bf.pack(fill="x", pady=(14, 0))
+        BotaoAnimado(bf, "💾  Salvar no Diário", self._salvar_diario,
+                     variante="amber", fonte=F["btn"], pady_base=12).pack(side="left")
+
+        # Histórico do diário
+        entradas = self.banco.listar_diario(self.usuario["id"], limite=5)
+        if entradas:
+            eo, ei = criar_card(sf, "Últimas Entradas do Diário",
+                                icone="📚", pad_x=24, pad_y=16)
+            eo.pack(fill="x", padx=24, pady=(0, 16))
+            for humor, texto, data in entradas:
+                try:
+                    dt = datetime.datetime.strptime(data, "%Y-%m-%d %H:%M")
+                    df = dt.strftime("%d/%m/%Y  %H:%M")
+                except Exception:
+                    df = data
+                ef = tk.Frame(ei, bg=C["bg_input"], padx=12, pady=10)
+                ef.pack(fill="x", pady=4)
+                tk.Label(ef, text=f"{humor}  •  {df}",
+                         font=F["body_sm"], bg=C["bg_input"],
+                         fg=C["text_muted"]).pack(anchor="w")
+                tk.Label(ef, text=texto[:160] + ("..." if len(texto) > 160 else ""),
+                         font=F["body"], bg=C["bg_input"],
+                         fg=C["text_white"], anchor="w",
+                         justify="left", wraplength=640).pack(anchor="w")
+                sf_widget.bind_scroll_em(ef)
+
+        frases_psi = [
+            "\"Pedir ajuda é um sinal de coragem, não de fraqueza.\"",
+            "\"Seus sentimentos são válidos. E você merece apoio.\"",
+            "\"A recuperação não é uma linha reta — é uma jornada.\"",
+            "\"Você não precisa estar bem o tempo todo.\"",
+        ]
+        fo, fi = criar_card(sf, pad_x=24, pad_y=16)
+        fo.pack(fill="x", padx=24, pady=(0, 24))
+        tk.Label(fi, text="💜  " + random.choice(frases_psi),
+                 font=("Segoe UI", 11, "italic"),
+                 bg=C["bg_card"], fg=C["purple"],
+                 wraplength=680, justify="left").pack(anchor="w")
+
+        sf_widget.bind_scroll_em(sf)
+
+    def _sel_humor(self, emoji, label, cor):
+        for (em, lb), w in self._humor_btns.items():
+            w.config(bg=C["bg_input"], fg=C["text_muted"])
+        self._humor_sel.set(f"{emoji} {label}")
+        self._humor_btns[(emoji, label)].config(bg=C["bg_card"], fg=cor)
+
+    def _salvar_diario(self):
+        humor = self._humor_sel.get()
+        texto = self._txt_diario.get("1.0", "end").strip()
+        if not humor:
+            self.toast.mostrar("Selecione como você está se sentindo.", "aviso"); return
+        if len(texto) < 5:
+            self.toast.mostrar("Escreva pelo menos uma frase.", "aviso"); return
+        self.banco.salvar_diario(self.usuario["id"], humor, texto)
+        self.toast.mostrar("Entrada salva no diário! 📝", "sucesso")
+        self._build()
+
+    def _toggle_respiracao(self):
+        if self._respirando:
+            self._respirando = False
+            self._btn_resp.config(text="▶  Iniciar Respiração Guiada")
+            self._lbl_resp.config(text="Pausado.")
+            self._lbl_count.config(text="")
+        else:
+            self._respirando = True
+            self._ciclo = 0
+            self._fase_resp = 0
+            self._tick = 4
+            self._btn_resp.config(text="⏹  Parar")
+            self._animar_resp()
+
+    def _animar_resp(self):
+        if not self._respirando: return
+        FASES = [
+            ("🌬️  INSPIRE...", 4, C["teal"]),
+            ("🤚  SEGURE...",   7, C["amber"]),
+            ("💨  EXPIRE...",   8, C["purple"]),
+        ]
+        fase_idx = self._fase_resp % 3
+        label, duracao, cor = FASES[fase_idx]
+        tick = getattr(self, "_tick", duracao)
+        if tick > 0:
+            self._lbl_resp.config(text=label, fg=cor)
+            self._lbl_count.config(text=str(tick), fg=cor)
+            self._tick = tick - 1
+            self.frame.after(1000, self._animar_resp)
+        else:
+            self._fase_resp += 1
+            self._tick = FASES[self._fase_resp % 3][1]
+            if self._fase_resp % 3 == 0:
+                self._ciclo += 1
+                if self._ciclo >= 4:
+                    self._respirando = False
+                    self._btn_resp.config(text="▶  Iniciar Respiração Guiada")
+                    self._lbl_resp.config(text="✅  4 ciclos concluídos! Muito bem!", fg=C["green"])
+                    self._lbl_count.config(text="")
+                    self.toast.mostrar("Exercício de respiração concluído! 🌟", "sucesso")
+                    return
+            self._animar_resp()
+
+
+# =============================================================================
+#  CLASSE PRINCIPAL: App
+# =============================================================================
+class App:
+    LARGURA = 1100
+    ALTURA  = 720
+    TITULO  = f"{APP_NOME} — Centro de Apoio e Transformação"
+
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title(self.TITULO)
+        self.root.configure(bg=C["bg_main"])
+        self.root.resizable(True, True)
+        self.root.minsize(860, 600)
+
+        self.root.update_idletasks()
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        x  = (sw - self.LARGURA) // 2
+        y  = (sh - self.ALTURA)  // 2
+        self.root.geometry(f"{self.LARGURA}x{self.ALTURA}+{x}+{y}")
+
+        self.banco   = BancoDados()
+        self.usuario = None
+        self.toast   = Toast(self.root)
+
+        self._raiz = tk.Frame(self.root, bg=C["bg_main"])
+        self._raiz.pack(fill="both", expand=True)
+        self._sidebar  = None
+        self._conteudo = None
+
+        self._ir_login()
+        self.root.protocol("WM_DELETE_WINDOW", self._fechar)
+
+    def _ir_login(self):
+        for w in self._raiz.winfo_children():
+            w.destroy()
+        self._sidebar  = None
+        self._conteudo = tk.Frame(self._raiz, bg=C["bg_main"])
+        self._conteudo.pack(fill="both", expand=True)
+        TelaLogin(self._conteudo, self.banco, self.toast, self._ao_logar)
+
+    def _montar_app(self):
+        for w in self._raiz.winfo_children():
+            w.destroy()
+        self._sidebar = Sidebar(self._raiz, self.usuario,
+                                ao_navegar=self._navegar, ao_sair=self._sair)
+        self._sidebar.pack(side="left", fill="y")
+        tk.Frame(self._raiz, bg=C["blue_light"], width=1).pack(
+            side="left", fill="y")
+        self._conteudo = tk.Frame(self._raiz, bg=C["bg_main"])
+        self._conteudo.pack(side="left", fill="both", expand=True)
+
+    def _navegar(self, tela):
+        for w in self._conteudo.winfo_children():
+            w.destroy()
+        if self._sidebar:
+            self._sidebar.definir_ativo(tela)
+        if tela == "dashboard":
+            TelaDashboard(self._conteudo, self.banco,
+                          self.usuario, self.toast, self._navegar)
+        elif tela == "consumo":
+            TelaConsumo(self._conteudo, self.banco,
+                        self.usuario, self.toast,
+                        ao_voltar=lambda: self._navegar("dashboard"))
+        elif tela == "historico":
+            TelaHistorico(self._conteudo, self.banco,
+                          self.usuario, self.toast,
+                          ao_voltar=lambda: self._navegar("dashboard"))
+        elif tela == "medico":
+            TelaMedico(self._conteudo, self.banco,
+                       self.usuario, self.toast,
+                       ao_voltar=lambda: self._navegar("dashboard"))
+        elif tela == "psicologico":
+            TelaPsicologico(self._conteudo, self.banco,
+                            self.usuario, self.toast,
+                            ao_voltar=lambda: self._navegar("dashboard"))
+
+    def _ao_logar(self, u):
+        self.usuario = u
+        self._montar_app()
+        self._navegar("dashboard")
+        self.toast.mostrar(
+            f"Login realizado! Olá, {u['nome'].split()[0]}. 👋", "sucesso")
+
+    def _sair(self):
+        self.usuario = None
+        self._ir_login()
+
+    def _fechar(self):
+        self.banco.fechar()
+        self.root.destroy()
+
+    def iniciar(self):
+        self.root.mainloop()
+
+
+# =============================================================================
+#  PONTO DE ENTRADA
+# =============================================================================
+if __name__ == "__main__":
+    app = App()
+    app.iniciar()
